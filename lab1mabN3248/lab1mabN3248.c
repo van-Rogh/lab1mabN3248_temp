@@ -19,12 +19,6 @@
 #define LAB1DEBUG_ENV_STR "LAB1DEBUG"
 static char *DEBUG = NULL;
 
-/**
- * Define all 'so' names which should be supported
- */
-#define FREQ_BYTE_PLUGIN_STR "lib1mabN3248.so"
-#define AVG_PLUGIN_STR "libavg.so"
-
 #define CURRENT_DIR_PATH "."
 
 #define NFTW_MAX_DIRS_OPENED 20
@@ -50,7 +44,6 @@ typedef int (*plugin_process_file_handle)(const char *, struct option[], size_t)
 
 typedef struct
 {
-    const char *plugin_name;
     plugin_get_info_handle get_info;
     plugin_process_file_handle process_file;
     struct option *process_file_opts;
@@ -59,34 +52,19 @@ typedef struct
 
 typedef struct
 {
-    const char *name;
+    char *name;
     char *fpath;
-    char is_obtained;
     char is_required;
     PluginAPI *plugin_api;
-
 } SupportedPlugin;
 
-static SupportedPlugin g_supported_plugins[] = {
-    {
-        .name = FREQ_BYTE_PLUGIN_STR,
-        .fpath = NULL,
-        .is_obtained = 0,
-        .is_required = 0,
-        .plugin_api = NULL,
-    },
-    {
-        .name = AVG_PLUGIN_STR,
-        .fpath = NULL,
-        .is_obtained = 0,
-        .is_required = 0,
-        .plugin_api = NULL,
-    }};
-static size_t g_supported_plugins_amount = sizeof(g_supported_plugins) / sizeof(SupportedPlugin);
+static SupportedPlugin *g_supported_plugins = NULL;
+static size_t g_supported_plugins_amount = 0;
 
 static void **g_dl_handles = NULL;
 static size_t g_dl_handles_amount = 0;
 
+static int is_plugin_name(const char *fpath, int base);
 static int obtain_plugin(const char *fpath, const struct stat *sb, int typeflag, struct FTW *ftwbuf);
 /*
     Updates g_supported_plugins variable
@@ -98,6 +76,9 @@ static int obtain_plugin_apis(const char *dirpath);
 /*
     Uses g_supported_plugins to process a file
 */
+
+static int are_new_options_intersected();
+
 static int process_file(const char *fpath, const struct stat *sb, int typeflag, struct FTW *ftwbuf);
 
 static void print_usage();
@@ -189,26 +170,29 @@ int main(int argc, char *argv[])
     /**
      * Obtain all available plugins from plugin_dirpath (default: ".")
      */
-    int obtained_plugins_amount = 0;
-    if ((obtained_plugins_amount = obtain_plugin_apis(plugin_dirpath)) == -1)
+    if (obtain_plugin_apis(plugin_dirpath) == -1)
         goto END;
 
+    if (are_new_options_intersected())
+    {
+        fprintf(stderr, "%s: There are intersections of options among obtained plugins. Try to use '%s' env to examine\n\n",
+                program_invocation_short_name, LAB1DEBUG_ENV_STR);
+        goto END;
+    };
     /**
      * Prepare supported long options array for further parsing
      */
-    plugins_info = (struct plugin_info *)calloc(obtained_plugins_amount, sizeof(struct plugin_info));
+    plugins_info = (struct plugin_info *)calloc(g_supported_plugins_amount, sizeof(struct plugin_info));
 
-    for (int i = 0; i < obtained_plugins_amount; ++i)
+    for (size_t i = 0; i < g_supported_plugins_amount; ++i)
     {
-        if (g_supported_plugins[i].is_obtained)
-        {
-            g_supported_plugins[i].plugin_api->get_info(&plugins_info[i]);
-            supported_long_opts_amount += plugins_info[i].sup_opts_len;
-        }
+
+        g_supported_plugins[i].plugin_api->get_info(&plugins_info[i]);
+        supported_long_opts_amount += plugins_info[i].sup_opts_len;
     }
     supported_long_opts = (struct option *)calloc(supported_long_opts_amount + 1, sizeof(struct option)); // +1 for "zero option"
     char previous_plugins_opts_amount = 0;
-    for (int i = 0; i < obtained_plugins_amount; ++i)
+    for (size_t i = 0; i < g_supported_plugins_amount; ++i)
     {
         for (size_t j = 0; j < plugins_info[i].sup_opts_len; ++j)
         {
@@ -221,7 +205,7 @@ int main(int argc, char *argv[])
     /**
      * Parse all options with check of unexpected options (from now all possible options are known)
      */
-    optind = 1;
+    optind = 0; // REINITIALIZE OF GETOPT
     supported_short_opts[0] = '+';
     while (1)
     {
@@ -241,41 +225,38 @@ int main(int argc, char *argv[])
                 else
                     fprintf(stderr, "\n");
             }
-            for (int i = 0; i < obtained_plugins_amount; ++i)
+            for (size_t i = 0; i < g_supported_plugins_amount; ++i)
             {
-                if (g_supported_plugins[i].is_obtained)
+                struct plugin_info pi;
+                g_supported_plugins[i].plugin_api->get_info(&pi);
+                for (size_t j = 0; j < pi.sup_opts_len; ++j)
                 {
-                    struct plugin_info pi;
-                    g_supported_plugins[i].plugin_api->get_info(&pi);
-                    for (size_t j = 0; j < pi.sup_opts_len; ++j)
+                    if (!strcmp(pi.sup_opts[j].opt.name, supported_long_opts[long_option_index].name))
                     {
-                        if (!strcmp(pi.sup_opts[j].opt.name, supported_long_opts[long_option_index].name))
+                        if (supported_long_opts[long_option_index].flag)
                         {
-                            if (supported_long_opts[long_option_index].flag)
-                            {
-                                fprintf(stderr, "[DEBUG]\t[CRIT]\t[%s]\t\tMore than one argument was provided for option '%s'\n",
-                                        program_invocation_short_name, supported_long_opts[long_option_index].name);
-                                goto END;
-                            }
-                            /* Dynamically fill options array for each required plugin with every its supported option */
-                            g_supported_plugins[i].is_required = 1;
-                            g_supported_plugins[i].plugin_api->process_file_opts_len++;
-                            supported_long_opts[long_option_index].flag = (int *)strdup(optarg);
-                            struct option *options = (struct option *)realloc(
-                                g_supported_plugins[i].plugin_api->process_file_opts,
-                                g_supported_plugins[i].plugin_api->process_file_opts_len * sizeof(struct option));
-                            if (options)
-                            {
-                                g_supported_plugins[i].plugin_api->process_file_opts = options; // Point to a new memory
-                                g_supported_plugins[i].plugin_api->process_file_opts
-                                    [g_supported_plugins[i].plugin_api->process_file_opts_len - 1] =
-                                    supported_long_opts[long_option_index];
-                            }
-                            else
-                            {
-                                fprintf(stderr, "Memory allocation error!\n");
-                                goto END;
-                            }
+                            fprintf(stderr, "[DEBUG]\t[CRIT]\t[%s]\t\tMore than one argument was provided for option '%s'\n",
+                                    program_invocation_short_name, supported_long_opts[long_option_index].name);
+                            goto END;
+                        }
+                        /* Dynamically fill options array for each required plugin with every its supported option */
+                        g_supported_plugins[i].is_required = 1;
+                        g_supported_plugins[i].plugin_api->process_file_opts_len++;
+                        supported_long_opts[long_option_index].flag = (int *)strdup(optarg);
+                        struct option *options = (struct option *)realloc(
+                            g_supported_plugins[i].plugin_api->process_file_opts,
+                            g_supported_plugins[i].plugin_api->process_file_opts_len * sizeof(struct option));
+                        if (options)
+                        {
+                            g_supported_plugins[i].plugin_api->process_file_opts = options; // Point to a new memory
+                            g_supported_plugins[i].plugin_api->process_file_opts
+                                [g_supported_plugins[i].plugin_api->process_file_opts_len - 1] =
+                                supported_long_opts[long_option_index];
+                        }
+                        else
+                        {
+                            fprintf(stderr, "Memory allocation error!\n");
+                            goto END;
                         }
                     }
                 }
@@ -316,7 +297,7 @@ int main(int argc, char *argv[])
             fprintf(stderr, "%s: No such directory '%s' to search files in\n", program_invocation_short_name, search_directory);
 
         else if (errno == EINVAL)
-            fprintf(stderr, "%s: Invalid option for one of plugins provided! \t\tTry to use '%s' env to examine\n",
+            fprintf(stderr, "%s: Invalid option for one of plugins provided. Try to use '%s' env to examine\n",
                     program_invocation_short_name,
                     LAB1DEBUG_ENV_STR);
         else
@@ -335,8 +316,10 @@ END:
         if (g_supported_plugins[i].plugin_api)
             free(g_supported_plugins[i].plugin_api->process_file_opts);
         free(g_supported_plugins[i].plugin_api);
+        free(g_supported_plugins[i].name);
         free(g_supported_plugins[i].fpath);
     }
+    free(g_supported_plugins);
     free(supported_short_opts);
     for (size_t i = 0; i < supported_long_opts_amount; ++i)
         free(supported_long_opts[i].flag);
@@ -344,22 +327,57 @@ END:
     return 0;
 }
 
+int is_plugin_name(const char *fpath, int base)
+{
+    const char *fname = fpath + base;
+    for (size_t i = 0; i < g_supported_plugins_amount; ++i)
+    {
+        if (!strcmp(fname, g_supported_plugins[i].name))
+        {
+            if (DEBUG)
+                fprintf(stderr, "[DEBUG]\t[ERROR]\t[%s]\t\tThere is a duplicated plugin of %s .  %s : %s\n",
+                        program_invocation_short_name, g_supported_plugins[i].name,
+                        g_supported_plugins[i].fpath, fpath);
+            return 0;
+        }
+    }
+    char *substring = NULL;
+    if (strstr(fname, "lib") && (substring = strstr(fname, ".so")) &&
+        strlen(fname) > strlen(substring) &&
+        (strlen(substring) > 3 ? (substring[3] == '.') : 1))
+    {
+        return 1;
+    }
+    return 0;
+}
+
 int obtain_plugin(const char *fpath, const struct stat *sb, int typeflag, struct FTW *ftwbuf)
 {
-    if (typeflag == FTW_F)
-        for (size_t i = 0; i < g_supported_plugins_amount; ++i)
-        {
-            if (!g_supported_plugins[i].is_obtained && !strcmp(g_supported_plugins[i].name, fpath + ftwbuf->base))
-            {
-                g_supported_plugins[i].is_obtained++;
-                g_supported_plugins[i].fpath = strdup(fpath);
-                if (DEBUG)
-                {
-                    fprintf(stderr, "[DEBUG]\t[INFO]\t[%s]\t\tObtained plugin: %s(%ld)\n", // For sake of usage (-Werror)
-                            program_invocation_short_name, g_supported_plugins[i].name, sb->st_size);
-                }
-            }
-        }
+    if (typeflag != FTW_F || !is_plugin_name(fpath, ftwbuf->base))
+        return 0;
+    g_supported_plugins_amount++;
+
+    SupportedPlugin *new_mem = (SupportedPlugin *)realloc(g_supported_plugins, g_supported_plugins_amount * sizeof(SupportedPlugin));
+    new_mem[g_supported_plugins_amount - 1].is_required = 0;
+    new_mem[g_supported_plugins_amount - 1].fpath = NULL;
+    new_mem[g_supported_plugins_amount - 1].name = NULL;
+    new_mem[g_supported_plugins_amount - 1].plugin_api = NULL;
+
+    if (new_mem)
+        g_supported_plugins = new_mem;
+    else
+    {
+        fprintf(stderr, "Memory allocation error!\n");
+        return -1;
+    }
+    g_supported_plugins[g_supported_plugins_amount - 1].name = strdup(fpath + ftwbuf->base);
+    g_supported_plugins[g_supported_plugins_amount - 1].fpath = strdup(fpath);
+    if (DEBUG)
+    {
+        fprintf(stderr, "[DEBUG]\t[INFO]\t[%s]\t\tObtained plugin: %s(%ld)\n", // For sake of usage (-Werror)
+                program_invocation_short_name, g_supported_plugins[g_supported_plugins_amount - 1].name, sb->st_size);
+    }
+
     return 0;
 }
 
@@ -368,65 +386,69 @@ int obtain_plugin_apis(const char *dirpath)
     if (nftw(dirpath, obtain_plugin, NFTW_MAX_DIRS_OPENED, NFTW_FLAGS) == -1)
     {
         if (errno == ENOENT)
-        {
             fprintf(stderr, "%s: No such directory '%s' to search plugins in!\n", program_invocation_short_name, dirpath);
-            return -1;
-        }
+        else if (errno = ENOMEM)
+            fprintf(stderr, "%s: Out of memory...\n", program_invocation_short_name);
         else
             perror("nftw");
         return -1;
     }
-    size_t obtained_plugins_amount = 0;
-    for (size_t i = 0; i < g_supported_plugins_amount; ++i)
-        if (g_supported_plugins[i].is_obtained)
-            obtained_plugins_amount++;
 
-    g_dl_handles = (void **)calloc(obtained_plugins_amount, sizeof(void *));
+    g_dl_handles = (void **)calloc(g_supported_plugins_amount, sizeof(void *));
 
-    if (DEBUG && obtained_plugins_amount)
+    if (DEBUG && g_supported_plugins_amount)
         fprintf(stderr, "[DEBUG]\t[INFO]\t[%s]\t\tAdditional available options:\n", program_invocation_short_name);
     for (size_t i = 0; i < g_supported_plugins_amount; ++i)
     {
-        if (g_supported_plugins[i].is_obtained)
+        g_supported_plugins[i].plugin_api = (PluginAPI *)calloc(g_supported_plugins_amount, sizeof(PluginAPI));
+
+        /**
+         * Obtain API
+         */
+
+        if (!(g_dl_handles[g_dl_handles_amount] = dlopen(g_supported_plugins[i].fpath, RTLD_LAZY)))
         {
-            g_supported_plugins[i].plugin_api = (PluginAPI *)calloc(obtained_plugins_amount, sizeof(PluginAPI));
-
-            g_supported_plugins[i].plugin_api->plugin_name = g_supported_plugins[i].name;
-
-            /**
-             * Obtain API
-             */
-
-            if (!(g_dl_handles[g_dl_handles_amount] = dlopen(g_supported_plugins[i].fpath, RTLD_LAZY)))
-            {
-                fprintf(stderr, "ERROR: dlopen() failed: %s\n", dlerror());
-                return -1;
-            }
-
-            if (!(g_supported_plugins[i].plugin_api->get_info =
-                      (plugin_get_info_handle)dlsym(g_dl_handles[g_dl_handles_amount], PLUGIN_GET_INFO_STR)))
-            {
-                fprintf(stderr, "ERROR: dlsym() failed: %s\n", dlerror());
-                return -1;
-            }
-
-            if (!(g_supported_plugins[i].plugin_api->process_file =
-                      (plugin_process_file_handle)dlsym(g_dl_handles[g_dl_handles_amount], PLUGIN_PROCESS_FILE_STR)))
-            {
-                fprintf(stderr, "ERROR: dlsym() failed: %s\n", dlerror());
-                return -1;
-            }
-            if (DEBUG)
-            {
-                struct plugin_info pi;
-                g_supported_plugins[i].plugin_api->get_info(&pi);
-                for (size_t j = 0; j < pi.sup_opts_len; ++j)
-                    fprintf(stderr, "[DEBUG]\t[INFO]\t[%s]\t\t\t%s\n", program_invocation_short_name, pi.sup_opts[j].opt.name);
-            }
-            g_dl_handles_amount++;
+            fprintf(stderr, "%s: Can't open obtained plugin: %s\n",
+                    program_invocation_short_name, dlerror());
+            return -1;
         }
+
+        if (!(g_supported_plugins[i].plugin_api->get_info =
+                  (plugin_get_info_handle)dlsym(g_dl_handles[g_dl_handles_amount], PLUGIN_GET_INFO_STR)) ||
+            !(g_supported_plugins[i].plugin_api->process_file =
+                  (plugin_process_file_handle)dlsym(g_dl_handles[g_dl_handles_amount], PLUGIN_PROCESS_FILE_STR)))
+        {
+            fprintf(stderr, "%s: Not a valid plugin has been found '%s': %s\n",
+                    program_invocation_short_name, g_supported_plugins[i].name, dlerror());
+            return -1;
+        }
+        if (DEBUG)
+        {
+            struct plugin_info pi;
+            g_supported_plugins[i].plugin_api->get_info(&pi);
+            for (size_t j = 0; j < pi.sup_opts_len; ++j)
+                fprintf(stderr, "[DEBUG]\t[INFO]\t[%s]\t\t\t%s\n", program_invocation_short_name, pi.sup_opts[j].opt.name);
+        }
+        g_dl_handles_amount++;
     }
-    return obtained_plugins_amount;
+    return g_supported_plugins_amount;
+}
+
+int are_new_options_intersected()
+{
+    for (size_t i = 0; i < g_supported_plugins_amount - 1; ++i)
+        for (size_t j = i + 1; j < g_supported_plugins_amount; ++j)
+        {
+            struct plugin_info pi1;
+            struct plugin_info pi2;
+            g_supported_plugins[i].plugin_api->get_info(&pi1);
+            g_supported_plugins[j].plugin_api->get_info(&pi2);
+            for (size_t v = 0; v < pi1.sup_opts_len; ++v)
+                for (size_t w = 0; w < pi2.sup_opts_len; w++)
+                    if (!strcmp(pi1.sup_opts[v].opt.name, pi2.sup_opts[w].opt.name))
+                        return 1;
+        }
+    return 0;
 }
 
 void print_usage()
@@ -441,7 +463,6 @@ Located in P_DIRECTORY plugins extend supported search options list.\n",
     printf("\t -N \t\t\tinvert the search term (after combining options plugins with -A or -O)\n");
     printf("\t -v \t\t\tdisplay the version of the program and information about the program and exit\n");
     printf("\t -h \t\t\tdisplay this help and exit\n");
-    printf("\t DO NOT MIX SHORT OPTIONS WITH LONG OPTIONS\n");
 }
 
 void print_info()
@@ -464,9 +485,10 @@ int process_file(const char *fpath, const struct stat *sb, int typeflag, struct 
         for (size_t i = 0; i < g_supported_plugins_amount; ++i)
             if (g_supported_plugins[i].is_required)
                 results_len++;
+
         results = (int *)calloc(results_len, sizeof(int));
         char should_print = 1;
-        for (size_t i = 0; i < g_supported_plugins_amount; ++i)
+        for (size_t i = 0; i < results_len; ++i)
         {
             if (g_supported_plugins[i].is_required)
             {
